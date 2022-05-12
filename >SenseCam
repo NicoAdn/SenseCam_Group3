@@ -1,0 +1,338 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include "BLE2902.h"
+#include "BLEHIDDevice.h"
+#include "HIDTypes.h"
+
+//IMU
+#include <Wire.h>
+#include <SPI.h>
+#include <SparkFunLSM9DS1.h>
+LSM9DS1 imu;
+
+#define PRINT_SPEED 250 // 250 ms between prints
+static unsigned long lastPrint = 0; // Keep track of print time
+
+
+//Definition of pins
+#define GSR 32
+#define PHOTO 35
+#define PULSE 34
+#define __MANUFACTURER "Michael Ruck"
+#define __BT_NAME "SenseCam_Group3"
+
+//IMU variables
+void printGyro();
+void printAccel();
+float AccX, AccY, AccZ;
+float Gx, Gy, Gz;
+float ACC_threshold=1.8;
+int GYRO_threshold=200;
+
+//GSR sensor variables
+int gsrValue=0;
+int gsr_average=0;
+int gsr_before=0;
+int eGSR;
+int GSR_threshold=15;
+int trigger_counter_=0;
+
+//Photoresistor variables
+int lightValue=0;
+int light_average=0;
+int light_before=0;
+int eLIGHT;
+int LIGHT_threshold=300;
+int trigger_counter=0;
+
+//PulseSensor variables
+int Pulse_signal;
+int iPulse;
+int first_pulse;
+int fifth_pulse;
+int current_gap;
+int last_gap;
+int ePulse;
+int Pulse_threshold = -1500;
+
+
+
+//Functions from Micheal Ruck allowing bluetooth keyboard emulation and Bluetooth connection  
+
+BLEHIDDevice* hid;
+BLECharacteristic* input;
+BLECharacteristic* output;
+
+bool connected = false;
+
+class MyCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      connected = true;
+      BLE2902* desc = (BLE2902*)input->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+      desc->setNotifications(true);
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+      connected = false;
+      BLE2902* desc = (BLE2902*)input->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+      desc->setNotifications(false);
+    }
+};
+
+/*
+   This callback is connect with output report. In keyboard output report report special keys changes, like CAPSLOCK, NUMLOCK
+   We can add digital pins with LED to show status
+   bit 0 - NUM LOCK
+   bit 1 - CAPS LOCK
+   bit 2 - SCROLL LOCK
+*/
+class MyOutputCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* me) {
+      uint8_t* value = (uint8_t*)(me->getValue().c_str());
+      ESP_LOGI(LOG_TAG, "special keys: %d", *value);
+    }
+};
+
+void taskServer(void*) {
+
+
+  BLEDevice::init(__BT_NAME);
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyCallbacks());
+
+  hid = new BLEHIDDevice(pServer);
+  input = hid->inputReport(1); // <-- input REPORTID from report map
+  output = hid->outputReport(1); // <-- output REPORTID from report map
+
+  output->setCallbacks(new MyOutputCallbacks());
+
+  std::string name = __MANUFACTURER;
+  hid->manufacturer()->setValue(name);
+
+  hid->pnp(0x02, 0xe502, 0xa111, 0x0210);
+  hid->hidInfo(0x00, 0x02);
+
+  BLESecurity *pSecurity = new BLESecurity();
+  //  pSecurity->setKeySize();
+  pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
+
+  const uint8_t report[] = {
+    USAGE_PAGE(1),      0x01,       // Generic Desktop Ctrls
+    USAGE(1),           0x06,       // Keyboard
+    COLLECTION(1),      0x01,       // Application
+    REPORT_ID(1),       0x01,        //   Report ID (1)
+    USAGE_PAGE(1),      0x07,       //   Kbrd/Keypad
+    USAGE_MINIMUM(1),   0xE0,
+    USAGE_MAXIMUM(1),   0xE7,
+    LOGICAL_MINIMUM(1), 0x00,
+    LOGICAL_MAXIMUM(1), 0x01,
+    REPORT_SIZE(1),     0x01,       //   1 byte (Modifier)
+    REPORT_COUNT(1),    0x08,
+    HIDINPUT(1),           0x02,       //   Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position
+    REPORT_COUNT(1),    0x01,       //   1 byte (Reserved)
+    REPORT_SIZE(1),     0x08,
+    HIDINPUT(1),           0x01,       //   Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position
+    REPORT_COUNT(1),    0x06,       //   6 bytes (Keys)
+    REPORT_SIZE(1),     0x08,
+    LOGICAL_MINIMUM(1), 0x00,
+    LOGICAL_MAXIMUM(1), 0x65,       //   101 keys
+    USAGE_MINIMUM(1),   0x00,
+    USAGE_MAXIMUM(1),   0x65,
+    HIDINPUT(1),           0x00,       //   Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position
+    REPORT_COUNT(1),    0x05,       //   5 bits (Num lock, Caps lock, Scroll lock, Compose, Kana)
+    REPORT_SIZE(1),     0x01,
+    USAGE_PAGE(1),      0x08,       //   LEDs
+    USAGE_MINIMUM(1),   0x01,       //   Num Lock
+    USAGE_MAXIMUM(1),   0x05,       //   Kana
+    HIDOUTPUT(1),          0x02,       //   Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile
+    REPORT_COUNT(1),    0x01,       //   3 bits (Padding)
+    REPORT_SIZE(1),     0x03,
+    HIDOUTPUT(1),          0x01,       //   Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile
+    END_COLLECTION(0)
+  };
+
+  hid->reportMap((uint8_t*)report, sizeof(report));
+  hid->startServices();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->setAppearance(HID_KEYBOARD);
+  pAdvertising->addServiceUUID(hid->hidService()->getUUID());
+  pAdvertising->start();
+  hid->setBatteryLevel(7);
+
+  ESP_LOGD(LOG_TAG, "Advertising started!");
+  delay(portMAX_DELAY);
+
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting BLE works!");
+
+
+  //IMU
+  Wire.begin(19, 23);       //Definition of the pin used for the I2C interface
+  if (imu.begin() == false) // with no arguments, this uses default addresses (AG:0x6B, M:0x1E) and i2c port (Wire).
+  {
+    Serial.println("Failed to communicate with LSM9DS1.");
+    Serial.println("Double-check wiring.");
+    Serial.println("Default settings in this sketch will " \
+                   "work for an out of the box LSM9DS1 " \
+                   "Breakout, but may need to be modified " \
+                   "if the board jumpers are.");
+    while (1);
+  }
+
+  xTaskCreate(taskServer, "server", 20000, NULL, 5, NULL);
+}
+
+void loop() {            //each function allow the detection of one type of event
+  GSR_sensor(); 
+  PhotoResistor();
+  IMU_();
+  Pulse();
+  delay(5);
+}
+
+
+void photo(){
+   if (connected) {                                                     //We check that the bluetooth connection is valid
+    Serial.println("Cheese...");
+
+    //Key press
+    uint8_t msg[] = {0x0, 0x0, 0x5d, 0x0, 0x0, 0x0, 0x0, 0x0};            //The device triggers picture taking by pressing a realeasing the "5" key
+    input->setValue(msg, sizeof(msg));
+    input->notify();
+
+    //Key release
+    uint8_t msg1[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+    input->setValue(msg1, sizeof(msg1));
+    input->notify();
+
+    delay(2000);
+
+  }
+  else{
+   Serial.println("No connection");
+  }
+}
+
+void GSR_sensor(){
+  long sum=0;
+  for(int i=0;i<10;i++)           //We average 10 measurements to better manage noise 
+      {
+      gsrValue=analogRead(GSR);
+      sum += gsrValue;
+      delay(3);
+      }
+   gsr_average = sum/10;
+   //Serial.println(gsr_average);
+   eGSR = gsr_average - gsr_before;
+   Serial.println(abs(eGSR));
+   if (eGSR >= GSR_threshold){                             //If the change is superior to the threshold the event is detected
+    if (trigger_counter_%2 == 0){                          //We added a counter to remove avoid taking two photos for each event
+     Serial.println("Change detected by GSR !");  
+     photo();
+    }
+     trigger_counter_++;
+   }
+   gsr_before = gsr_average;
+}
+
+void PhotoResistor(){
+  long s=0;
+  for(int i=0;i<5;i++)           //We average 5 measurements to better manage noise 
+      {
+      lightValue=analogRead(PHOTO);
+      s += lightValue;
+      delay(3);
+      }
+   light_average = s/5;
+   //Serial.println(light_average);
+   eLIGHT = abs(light_average - light_before);
+   if (eLIGHT >= LIGHT_threshold){                            //If the change is superior to the threshold the event is detected
+     if (trigger_counter%2 == 0){                             //We added a counter to remove avoid taking two photos for each event
+      Serial.println("Change detected by photoresistor !");
+      photo();
+     }
+     trigger_counter++;
+   }
+   light_before = light_average;
+}
+
+void IMU_(){
+  
+  // Update the sensor values whenever new data is available
+  if ( imu.gyroAvailable() )
+  {
+
+    imu.readGyro();
+  
+  }
+  if ( imu.accelAvailable() )
+  {
+
+    imu.readAccel();
+  }
+
+
+
+  AccX = imu.calcAccel(imu.ax);
+  AccY = imu.calcAccel(imu.ay);
+  AccZ = imu.calcAccel(imu.az);
+
+  Gx = imu.calcGyro(imu.gx);
+  Gy = imu.calcGyro(imu.gy);
+  Gz = imu.calcGyro(imu.gz);
+
+  
+  if ( abs(AccX) >= ACC_threshold || abs(AccY) >= ACC_threshold || abs(AccZ) >= ACC_threshold){      //If the change is superior to the threshold the event is detected 
+    Serial.println("Move detected by accelerometer!");
+    photo();
+  }
+  
+  else if (abs(Gx) >= GYRO_threshold || abs(Gy) >= GYRO_threshold || abs(Gz) >= GYRO_threshold){     //If the change is superior to the threshold the event is detected
+    Serial.println("Move detected by gyro !");
+    photo();
+  }
+}
+
+void Pulse(){
+  
+  Pulse_signal = analogRead(PULSE);  // Read the PulseSensor's value.
+
+  
+   if (Pulse_signal >= 2500 || Pulse_signal <= 1500 ){             //We check if the value collected is coherent, if not we restart the counting of pulses
+       iPulse=0;
+       Serial.println("Pulse not coherent, restarting measuring"); 
+    }
+    if (Pulse_signal >= 1900 && Pulse_signal <= 2300 ){            
+
+      if (iPulse == 0){
+         first_pulse = millis();                                  //If the pulse is coherent we start counting
+         }
+                  
+      iPulse++;
+      delay(150);
+                  
+      if (iPulse == 6){                                         //After five pulse we measure the elapsed time
+         fifth_pulse = millis();
+         current_gap = fifth_pulse - first_pulse;
+         Serial.print("current_gap : "); 
+         Serial.println(current_gap);
+         ePulse = current_gap - last_gap;
+         Serial.print("ePulse : "); 
+         Serial.println(ePulse);
+         if (ePulse < Pulse_threshold  && current_gap >= 2000 && current_gap <= 5500 && last_gap >= 2000 && last_gap <= 5500){             //If the change is superior to the threshold and the values are coherent, the event is detected
+            Serial.println("Change detected by pulse sensor !");
+            photo();
+         }
+         last_gap = current_gap;
+         iPulse = 0;                                      //reset of the counter
+         }
+    }  
+    
+    
+               
+}
